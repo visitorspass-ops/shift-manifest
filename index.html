@@ -9,7 +9,7 @@
      page no longer depends on a CDN that a locked-down office machine may block.
      0.20.3 is past CVE-2023-30533 and CVE-2024-22363, both present in the 0.18.5 build. -->
 <!-- SheetJS, served from this origin. Split out of the HTML so every file
-     stays under GitHub's 1 MB web-editor limit and the browser can cache it
+     clears GitHub's 1 MB web-editor limit and the browser can cache it
      separately from the app. Same build, byte for byte. -->
 <script src="/xlsx.js"></script>
 <style>
@@ -469,9 +469,9 @@
   .field label{font-size:9px;color:var(--muted-dim);text-transform:uppercase;letter-spacing:.06em;font-family:'JetBrains Mono',monospace;}
   .formRow{display:flex;gap:10px;} .formRow .field{flex:1;}
   .permitItem{display:flex;justify-content:space-between;align-items:center;padding:9px 11px;background:var(--panel2);border:1px solid var(--border);border-radius:6px;margin-bottom:7px;font-size:12px;}
-  /* ---- sign-in gate ----
-     Covers the page until Supabase returns a session, so no data request is ever
-     made anonymously. Never shown on the offline build. */
+  /* ---- sign-in gate -------------------------------------------------
+     Covers the page until Supabase returns a session, so nothing is ever
+     requested anonymously. Never shown on the offline build. */
   #authGate{position:fixed;inset:0;z-index:9000;display:none;align-items:center;justify-content:center;
             background:var(--bg);padding:24px;}
   #authGate.show{display:flex;}
@@ -492,10 +492,10 @@
                  cursor:pointer;font-size:10.5px;font-family:inherit;padding:0 0 0 6px;}
 </style>
   <!-- Loaded from this origin, not a CDN: no third-party dependency at runtime.
-       supabase-js cannot be inlined (its UMD bundle reads publicPath from its own
-       script src). When these files are absent — opening this HTML on its own —
-       window.supabase and the config are undefined, and the page runs in its
-       original offline mode against IndexedDB. -->
+       supabase-js is not inlined because its UMD bundle derives publicPath from
+       its own script src, which an inline tag does not have. When these files are
+       absent (opening the HTML on its own) the page falls back to IndexedDB and
+       behaves exactly as the local build. -->
   <script src="/supabase.js"></script>
   <script src="/config.js"></script>
 </head>
@@ -806,25 +806,24 @@ const LocalDb = {
   }
 };
 
-/* Reassigned at boot when hosted. Data, Meta AND Extras all read through this
-   one name, so day events, annotations, the coaching log, exceptions, skills
-   certification and team assignments all become shared without touching them. */
+/* Reassigned at boot when hosted. Data, Meta and Extras all read through this
+   one name, so pointing it elsewhere moves the whole app with it. */
 let db = LocalDb;
 
 
 /* ============================================================
-   REMOTE STORE  (hosted build)
+   SHARED STORE  (hosted build)
    ------------------------------------------------------------
-   Everything this application persists — day events, order ladders, summaries,
-   name maps, attendance, break permits, exclusions, the coaching log,
-   exceptions, skills certification, team leaders and assignments — goes through
-   ONE key/value shim with four methods. So hosting it is a change of backend,
-   not a rewrite: every view, drawer, benchmark toggle and formula below is the
+   Day events, order ladders, summaries, name maps, attendance, break permits,
+   exclusions, the coaching log, exceptions, skills certification and team
+   assignments all read and write through ONE key/value shim with four methods.
+   That is what the data access layer was for: hosting this app is a change of
+   backend, not a rewrite. Every view, drawer, toggle and formula below is the
    same code, now reading the same data for everyone.
 
-   Reads require any signed-in user WITH a role; writes require `admin`. That is
-   enforced by row-level security in Postgres, not here — this client is the
-   convenience, the database is the control.
+   Reads need any signed-in user with a role; writes need `admin`. Enforced by
+   row-level security in the database — this client is the convenience, the
+   policy is the control.
    ============================================================ */
 const SB_URL  = window.__SB_URL__  || '';
 const SB_ANON = window.__SB_ANON__ || '';
@@ -833,7 +832,7 @@ const Auth = {
   client:null, user:null, roles:[],
   init(){
     if(this.client) return this.client;
-    if(!window.supabase) throw new Error('Supabase client failed to load.');
+    if(!window.supabase) throw new Error('Sign-in failed to load. Reload the page.');
     this.client = window.supabase.createClient(SB_URL, SB_ANON, {
       auth:{persistSession:true, autoRefreshToken:true, storageKey:'wfm-auth'}
     });
@@ -863,9 +862,9 @@ const RemoteDb = {
     return data ? data.value : null;
   },
   async set(k, v){
-    /* A read-only role reaches here on load — Extras persists a seed on first
-       run. Refuse quietly rather than firing a toast at someone who did
-       nothing wrong; row-level security would reject it anyway. */
+    /* Read-only roles reach this on incidental writes — the skills seed on
+       first load, for instance. The database would refuse them anyway; failing
+       quietly beats a toast the viewer can do nothing about. */
     if(!Auth.isAdmin()) return false;
     const {error} = await this._c().from('kv')
       .upsert({key:k, value:v, updated_at:new Date().toISOString()}, {onConflict:'key'});
@@ -878,8 +877,8 @@ const RemoteDb = {
     if(error) showToast('Could not remove ' + k + ': ' + error.message);
   },
   async keys(prefix){
-    /* Keys only, never payloads, and paged: listing stored days has to stay
-       cheap however many months accumulate. */
+    /* Keys only, never payloads — listing stored days must stay cheap however
+       many months accumulate. */
     const out = [], page = 1000;
     for(let from = 0; ; from += page){
       const {data, error} = await this._c().from('kv')
@@ -6151,7 +6150,8 @@ document.addEventListener('click', (e)=>{
 });
 
 /* --- boot --- */
-/* Hosted: sign in, then read the shared store. Opened on its own (no config.js):
+/* ---------- boot ----------
+   Hosted: sign in, then read the shared store. Opened on its own (no config.js):
    straight through to IndexedDB, which is how this logic was validated and how
    it stays usable without a network. */
 const HOSTED = !!(SB_URL && SB_ANON);
@@ -6202,7 +6202,7 @@ function stampWhoami(){
     Auth.user = session.user;
     await Auth.loadRoles();
     if(!Auth.roles.length){
-      /* Signed in, but no role granted. Say so, rather than showing an empty
+      /* Signed in but no role granted. Say so, rather than showing an empty
          dashboard that reads as broken. */
       err.textContent = 'This account has no role yet — ask an admin to grant one.';
       await Auth.init().auth.signOut();
