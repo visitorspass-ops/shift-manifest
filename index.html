@@ -551,6 +551,7 @@
       <button class="ghostBtn" onclick="openFileManifestDrawer()">Uploaded files</button>
       <button class="ghostBtn" onclick="backToUpload()">Add files</button>
       <button class="ghostBtn" onclick="handleClearAll()">Clear saved data</button>
+      <button class="ghostBtn" id="storeCheckBtn" style="display:none;" onclick="drawerStoreCheck()">Check shared store</button>
     </div>
   </div>
   <div class="viewTabs" id="viewTabs"></div>
@@ -6150,6 +6151,100 @@ document.addEventListener('click', (e)=>{
 });
 
 /* --- boot --- */
+
+/* ============================================================
+   SHARED STORE DIAGNOSTIC
+   ------------------------------------------------------------
+   Built after three rounds of debugging this integration from the outside.
+   Every failure so far — a dead project, a silent write, data that was
+   actually there — looked identical from the UI: an empty dashboard. This
+   does a real round trip and prints what the database said, so the next
+   question is answered by evidence rather than inference.
+
+   It writes one tiny row under 'diag:' and removes it again. It never
+   touches real data.
+   ============================================================ */
+async function runStoreCheck(){
+  const out = [];
+  const add = (label, ok, detail) => out.push({label, ok, detail: detail===undefined?'':String(detail)});
+  const t0 = Date.now();
+
+  /* Offline is a valid state, not a fault — never flag it red. */
+  add('Mode', true, HOSTED ? 'hosted — shared store' : 'offline — this browser only');
+  if(!HOSTED){ return {out, ms: Date.now()-t0}; }
+
+  add('Project', !!SB_URL, SB_URL);
+  add('Signed in as', !!(Auth.user && Auth.user.email), Auth.user ? Auth.user.email : 'nobody');
+  add('Roles', Auth.roles.length > 0, Auth.roles.length ? Auth.roles.join(', ') : 'none granted');
+  add('Can upload', Auth.isAdmin(), Auth.isAdmin() ? 'yes (admin)' : 'no — read only');
+
+  /* Reachability and the roles read, separately: a dead host and an RLS
+     refusal are different problems that look the same from the dashboard. */
+  try{
+    const {error} = await Auth.init().from('user_roles').select('role').limit(1);
+    add('Database reachable', !error, error ? error.message : 'yes');
+  }catch(ex){ add('Database reachable', false, ex.message); }
+
+  // READ: what is actually stored, by prefix. Keys only, never payloads.
+  const prefixes = [['ev:','day data'],['ladder:','order ladders'],['sum:','day summaries'],
+                    ['names:','name map'],['permits:','break permits'],['coaching:','coaching log']];
+  let totalDays = 0;
+  for(const [p, label] of prefixes){
+    try{
+      const keys = await RemoteDb.keys(p);
+      if(p === 'ev:') totalDays = keys.length;
+      add('Read ' + label, keys.length > 0,
+          keys.length + ' key' + (keys.length===1?'':'s') +
+          (p === 'ev:' && keys.length ? ' — ' + keys.map(k=>k.slice(3)).sort().join(', ') : ''));
+    }catch(ex){ add('Read ' + label, false, ex.message); }
+  }
+
+  /* WRITE round trip. The read above can succeed while writes fail silently,
+     which is exactly what happened here before — so prove it end to end
+     rather than assuming one implies the other. */
+  const probe = 'diag:' + Date.now();
+  if(Auth.isAdmin()){
+    try{
+      const wrote = await RemoteDb.set(probe, {at:new Date().toISOString()});
+      add('Write a test row', wrote === true, wrote ? 'ok' : 'refused — see the toast, or the browser console');
+      if(wrote){
+        const back = await RemoteDb.get(probe);
+        add('Read it back', !!back, back ? 'ok' : 'written but not readable — check the SELECT policy');
+        await RemoteDb.del(probe);
+        const gone = await RemoteDb.get(probe);
+        add('Clean up', !gone, gone ? 'test row left behind: ' + probe : 'ok');
+      }
+    }catch(ex){ add('Write a test row', false, ex.message); }
+  } else {
+    add('Write a test row', true, 'skipped — read-only account, as intended');
+  }
+
+  add('Days visible to this account', totalDays > 0, totalDays);
+  return {out, ms: Date.now()-t0};
+}
+
+function drawerStoreCheck(){
+  const build = async (host)=>{
+    host.innerHTML = '<p class="muted">Checking…</p>';
+    const {out, ms} = await runStoreCheck();
+    const rows = out.map(r=>`<tr>
+        <td class="left">${esc(r.label)}</td>
+        <td><span class="pill ${r.ok?'go':'red'}">${r.ok?'ok':'problem'}</span></td>
+        <td class="left wrap">${esc(r.detail)}</td></tr>`).join('');
+    const bad = out.filter(r=>!r.ok).length;
+    host.innerHTML = `
+      <p>${bad===0
+          ? 'Everything checked out. If a colleague still sees nothing, their account has no role yet — grant one and have them sign in again.'
+          : bad+' check'+(bad===1?'':'s')+' failed. The failing row names the cause; the detail column is what the database actually said.'}</p>
+      <table class="dataTable"><thead><tr>
+        <th class="left">Check</th><th>Result</th><th class="left">Detail</th>
+      </tr></thead><tbody>${rows}</tbody></table>
+      <p class="muted" style="margin-top:10px;">Round trip took ${ms} ms. The test row is written under
+      <code>diag:</code> and removed again — real data is never touched.</p>`;
+  };
+  openDrawer('Shared store', 'Shared store check', 'Does this account read and write the shared data?', build);
+}
+
 /* ---------- boot ----------
    Hosted: sign in, then read the shared store. Opened on its own (no config.js):
    straight through to IndexedDB, which is how this logic was validated and how
@@ -6173,8 +6268,18 @@ async function startApp(){
        write anyway, and a button that cannot work is just a trap. */
     const up = document.getElementById('uploadGate');
     if(up) up.style.display = 'none';
-    if(days) await enterShell();
   }
+  /* Hosted, with data already on the shared store: go STRAIGHT to it, for
+     everyone including admins.
+     Landing on the upload screen is right for the local file, where every
+     session starts by dropping files. On a hosted site it is actively
+     misleading — a second person signs in, sees "drop your files here", and
+     reasonably concludes the upload never saved. It had saved; the data was
+     one unmarked button away. Admins lose nothing: "Add files" sits in the
+     top bar of the shell. */
+  if(HOSTED && days){ await enterShell(); }
+  if(HOSTED){ const sc = document.getElementById('storeCheckBtn');
+              if(sc) sc.style.display = 'inline-block'; }
   stampWhoami();
 }
 
